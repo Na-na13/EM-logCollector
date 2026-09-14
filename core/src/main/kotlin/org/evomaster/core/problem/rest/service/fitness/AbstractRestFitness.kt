@@ -1178,7 +1178,7 @@ abstract class AbstractRestFitness : HttpWsFitness<RestIndividual>() {
                 if (id != null) {
 
                     //FIXME tmp fix. need to be handled properly, also in generated tests with test-utils-*
-                    val escapedId = URLEncoder.encode(id.value, StandardCharsets.UTF_8)
+                    val escapedId = URLEncoder.encode(id.value, StandardCharsets.UTF_8.name())
                         .replace("+", "%20");
 
                     location = callGraphService.resolveLocationForChildOperationUsingCreatedResource(a,escapedId)
