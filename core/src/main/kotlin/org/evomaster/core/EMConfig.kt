@@ -969,6 +969,10 @@ class EMConfig {
         if(namingStrategy == NamingStrategy.LLM && !llm){
             throw ConfigProblemException("Naming strategy LLM require the setup and use of an LLM")
         }
+
+        if(enableLogCollector && logCollectorComposeProject.isBlank()){
+            throw ConfigProblemException("'logCollectorComposeProject' must be specified if 'enableLogCollector' is enabled.")
+        }
     }
 
     private fun checkPropertyConstraints(m: KMutableProperty<*>) {
@@ -3630,11 +3634,44 @@ class EMConfig {
     var inferFormatFromNames = false
 
     @Experimental
-    @Cfg("Enable log-based coverage: collect Docker container logs after each test and use novel log templates" +
-            " (detected via Drain log parsing) as additional fitness targets." +
-            " Requires Docker to be running on the host; the evolog-parser Docker image is pulled automatically." +
-            " The Docker Compose project to monitor can be specified via the LOG_COLLECTOR_PROJECT environment variable.")
+    @Cfg("Enable log-based coverage: follow the Docker container logs of the SUT, and use the log templates" +
+            " (detected via Drain log parsing) of the lines logged during each test as additional fitness targets." +
+            " Requires Docker to be running on the host, and the SUT to run as a Docker Compose project" +
+            " (see 'logCollectorComposeProject'). The log parser is started automatically as a Docker container.")
     var enableLogCollector = false
+
+    @Experimental
+    @Cfg("Name of the Docker Compose project whose containers are the SUT, and whose logs are followed by the log collector." +
+            " Must be specified if 'enableLogCollector' is enabled.")
+    @DependsOnTrueFor("enableLogCollector")
+    var logCollectorComposeProject = ""
+
+    @Experimental
+    @Cfg("Docker image of the log parser service started by the log collector.")
+    @DependsOnTrueFor("enableLogCollector")
+    var logCollectorParserImage = "nanarei/evolog-parser:latest"
+
+    @Experimental
+    @Cfg("Whether the log collector should write a file listing all log templates found so far," +
+            " with their target ids and template texts.")
+    @DependsOnTrueFor("enableLogCollector")
+    var logCollectorWriteTemplates = false
+
+    @Experimental
+    @Cfg("Where the log templates file (if any) is going to be written.")
+    @FilePath(false,true)
+    var logCollectorTemplatesFile = "logTemplates.txt"
+
+    @Experimental
+    @Cfg("Whether the log collector should write a trace file, with one JSON entry per test evaluation" +
+            " containing the raw log lines credited to it and the log templates they matched.")
+    @DependsOnTrueFor("enableLogCollector")
+    var logCollectorWriteTrace = false
+
+    @Experimental
+    @Cfg("Where the log collector trace file (if any) is going to be written.")
+    @FilePath(false,true)
+    var logCollectorTraceFile = "logCollectorTrace.jsonl"
 
 
     @Experimental

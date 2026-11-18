@@ -1,27 +1,42 @@
 package org.evomaster.core.extra.logcollector;
 
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
-import java.time.Instant;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.evomaster.core.extra.shared.AdditionalTargetCollector;
 import org.evomaster.core.extra.shared.TargetInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.testcontainers.DockerClientFactory;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.output.Slf4jLogConsumer;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.utility.DockerImageName;
 
 /**
  * An {@link AdditionalTargetCollector} that uses log-template coverage as an extra fitness signal.
- * After each test, it collects Docker container logs and uses Drain (via loglead) to extract
- * novel log event templates, which are reported as additional coverage targets to EvoMaster.
+ *
+ * <p>The SUT's Docker container logs are followed by a {@link DockerLogFollower}. After each test,
+ * the lines logged during that test are sent to the parser service, which reduces them to log
+ * templates with Drain. Each template is reported as a target {@code log:<source>:<drainId>}.</p>
+ *
+ * <p>Lines are attributed to tests without timestamps: everything logged between the start and
+ * the end of a test belongs to that test, and lines logged between tests (e.g. while the SUT is
+ * reset) are discarded.</p>
+ *
+ * <p>The parser runs in a Docker container started with Testcontainers, which also removes it
+ * when the JVM exits. See {@code DESIGN.md} in this module for the full design.</p>
  *
  * <p>Note: {@code LoggerFactory.getLogger()} is used here instead of {@code LoggingUtil.getInfoLogger()}
  * because this module ({@code core-extra}) cannot depend on {@code core} without creating a circular
@@ -29,231 +44,139 @@ import org.slf4j.LoggerFactory;
  */
 public class LogCollector implements AdditionalTargetCollector {
 
-  /** Accumulated targets for the current test; cleared at the start of each new test. */
-  private final List<TargetInfo> results = new ArrayList<>();
-
-  // LoggerFactory is used instead of LoggingUtil (see class-level note above).
   private static final Logger log = LoggerFactory.getLogger(LogCollector.class);
 
-  /** Absolute path of the EvoMaster working directory; all output paths are resolved relative to it. */
-  private final Path workDir;
+  /** Port the parser's HTTP server listens on inside its container. Part of the image contract. */
+  private static final int PARSER_PORT = 8080;
 
-  /** Command used to launch the parser daemon process. */
-  private String[] daemonCommand;
+  private static final Duration PARSE_TIMEOUT = Duration.ofSeconds(60);
 
-  /** Path to the file capturing daemon stderr output: {@code {workDir}/logs/processbuilder-log}. */
-  private String logFilePath;
+  private final ObjectMapper mapper = new ObjectMapper();
 
-  /** Path to the Drain results file written by the daemon: {@code {workDir}/templates/unique-templates.txt}. */
-  private String uniqueTemplatesFile;
+  private final HttpClient http = HttpClient.newBuilder()
+      .connectTimeout(Duration.ofSeconds(10))
+      .build();
 
-  /**
-   * Docker Compose project name used to filter which containers are monitored.
-   * Read from the {@code LOG_COLLECTOR_PROJECT} environment variable; {@code null} means all containers.
-   */
-  private final String composeProject;
+  private final DockerLogFollower follower;
 
-  /** Epoch-millisecond timestamp recorded at the start of each test execution. */
-  private long startTimeMillis;
+  /** Kept so the container's lifetime is tied to this collector; Testcontainers removes it on JVM exit. */
+  private final GenericContainer<?> parser;
 
-  /**
-   * Persistent daemon process kept alive across all tests to avoid paying Python's startup
-   * cost (loading docker, polars, loglead) on every test.
-   * Non-final so it can be replaced if the daemon crashes and must be restarted.
-   */
-  private Process daemonProcess;
+  private final URI parseUri;
 
-  /** Writer wired to the daemon's stdin; used to send time-window requests. */
-  private BufferedWriter daemonIn;
-
-  /** Reader wired to the daemon's stdout; used to receive "OK" / "ERROR" responses. */
-  private BufferedReader daemonOut;
+  /** {@code null} when no inspection output is enabled. */
+  private final InspectionWriter writer;
 
   /**
-   * Creates a LogCollector for production use.
+   * Starts following the SUT's container logs and starts the parser container.
    *
-   * <p><strong>Side effects:</strong></p>
-   * <ul>
-   *   <li>Creates {@code logs/} and {@code templates/} directories under the working directory.</li>
-   *   <li>Pulls and starts the parser daemon as a Docker container ({@code nanarei/evolog-parser:latest}).</li>
-   *   <li>Registers a JVM shutdown hook that closes the daemon and deletes collected log files.</li>
-   * </ul>
+   * @param composeProject Docker Compose project whose containers are followed
+   * @param parserImage    Docker image of the parser service
+   * @param templatesFile  path of the templates file, or {@code null} to not write it
+   * @param traceFile      path of the trace file, or {@code null} to not write it
+   * @throws IllegalStateException if no container of the project is running
+   * @throws RuntimeException      if the parser container cannot be started
    */
-  public LogCollector() {
-    workDir = Paths.get("").toAbsolutePath();
-    composeProject = System.getenv("LOG_COLLECTOR_PROJECT");
+  // "resource": the parser container is deliberately never closed here; it must run for the
+  // whole search, and Testcontainers removes it when the JVM exits.
+  @SuppressWarnings("resource")
+  public LogCollector(String composeProject, String parserImage, String templatesFile, String traceFile) {
+    // Done first, so a wrong project name fails fast, before a possibly long image pull.
+    follower = new DockerLogFollower(DockerClientFactory.instance().client(), composeProject);
 
-    // Build the docker run command. The parser daemon runs as a container so the
-    // user needs no local Python installation. The Docker socket is mounted so the
-    // container can reach the host Docker daemon to fetch SUT container logs.
-    List<String> cmd = new ArrayList<>(Arrays.asList(
-        "docker", "run", "--rm", "-i",
-        "-v", workDir + "/logs:/app/logs",
-        "-v", workDir + "/templates:/app/templates",
-        "-v", "/var/run/docker.sock:/var/run/docker.sock"
-    ));
-    if (composeProject != null && !composeProject.isEmpty()) {
-      cmd.add("-e");
-      cmd.add("COMPOSE_PROJECT=" + composeProject);
-    }
-    cmd.add("nanarei/evolog-parser:latest");
-    daemonCommand = cmd.toArray(new String[0]);
+    parser = new GenericContainer<>(DockerImageName.parse(parserImage))
+        .withExposedPorts(PARSER_PORT)
+        .waitingFor(Wait.forHttp("/health"))
+        .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("parser"));
+    parser.start();
+    parseUri = URI.create("http://" + parser.getHost() + ":" + parser.getMappedPort(PARSER_PORT) + "/parse");
+    log.info("Log parser started from image {} at {}", parserImage, parseUri);
 
-    initCommon();
+    writer = (templatesFile != null || traceFile != null)
+        ? new InspectionWriter(templatesFile, traceFile)
+        : null;
   }
 
   /**
-   * Package-private constructor for tests: skips JAR extraction and drives a custom daemon command.
-   * Has the same side effects as the public constructor except no file is extracted from the JAR.
+   * The fitness target id of a log template, e.g. {@code log:oauth2-client:17}.
+   * Uses the stable Drain cluster id, never the template text, which can change during the run.
    */
-  LogCollector(String[] daemonCommand) {
-    workDir = Paths.get("").toAbsolutePath();
-    this.daemonCommand = daemonCommand;
-    composeProject = null;
-    initCommon();
-  }
-
-  /**
-   * Shared initialisation for both constructors.
-   *
-   * <p><strong>Side effects:</strong> creates directories on disk, spawns the parser daemon subprocess,
-   * and registers a JVM shutdown hook that stops the daemon and cleans up collected log files.</p>
-   */
-  private void initCommon() {
-    logFilePath         = workDir.resolve("logs/processbuilder-log").toString();
-    uniqueTemplatesFile = workDir.resolve("templates/unique-templates.txt").toString();
-
-    try {
-      Files.createDirectories(Paths.get(logFilePath).getParent());
-      Files.newOutputStream(Paths.get(logFilePath),
-          StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING).close();
-    } catch (IOException ignored) {}
-
-    try {
-      Files.createDirectories(Paths.get(uniqueTemplatesFile).getParent());
-    } catch (IOException ignored) {}
-
-    try {
-      startDaemon();
-    } catch (IOException e) {
-      throw new RuntimeException("Failed to start parser daemon", e);
-    }
-
-    Path evoLogsDir = workDir.resolve("logs/evomaster-logs");
-    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-      // Closing daemonIn signals the Python daemon to exit cleanly (EOF on stdin).
-      try { daemonIn.close(); } catch (IOException ignored) {}
-      if (!Files.exists(evoLogsDir)) return;
-      try {
-        Files.walk(evoLogsDir)
-            .sorted(Comparator.reverseOrder())
-            .forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
-      } catch (IOException ignored) {}
-    }));
-  }
-
-  // The daemon runs with CWD as its working directory so relative paths in parser.py resolve correctly.
-  private void startDaemon() throws IOException {
-    ProcessBuilder pb = new ProcessBuilder(daemonCommand);
-    pb.directory(workDir.toFile());
-    // Redirect daemon stderr to the log file so debug output does not pollute the IPC stdout channel.
-    pb.redirectError(new File(logFilePath));
-    daemonProcess = pb.start();
-    daemonIn  = new BufferedWriter(new OutputStreamWriter(
-        daemonProcess.getOutputStream(), StandardCharsets.UTF_8));
-    daemonOut = new BufferedReader(new InputStreamReader(
-        daemonProcess.getInputStream(), StandardCharsets.UTF_8));
-  }
-
-  // Forcibly kills the current daemon and starts a fresh one so subsequent tests are not blocked.
-  private void restartDaemon() {
-    try {
-      daemonProcess.destroyForcibly();
-    } catch (Exception ignored) {}
-    try {
-      startDaemon();
-      log.warn("Parser daemon restarted successfully");
-    } catch (IOException e) {
-      log.error("Failed to restart parser daemon: {}", e.getMessage());
-    }
+  static String targetId(String source, String drainId) {
+    return "log:" + source + ":" + drainId;
   }
 
   @Override
   public void goingToStartExecutingNewTest() {
-    log.info("Going to start executing new test");
-    results.clear();
-    startTimeMillis = Instant.now().toEpochMilli();
+    // Lines logged since the previous test ended were not caused by any test, e.g. SUT reset output.
+    int discarded = follower.drainNewLines().size();
+    log.debug("Discarded {} log lines logged between tests", discarded);
   }
 
   @Override
   public void reportActionIndex(int actionIndex) {
-    // actionIndex is not tracked; TargetInfo uses -1 to indicate absence
+    // Not used: targets are reported per test, so TargetInfo uses -1 as action index.
   }
 
   @Override
   public List<TargetInfo> testFinishedCollectResult() {
-    log.info("Test finished, collecting log templates");
-    results.clear();
+    List<DockerLogFollower.Line> lines = follower.drainNewLines();
 
-    long endTimeMillis = Instant.now().toEpochMilli();
-
-    if (!daemonProcess.isAlive()) {
-      log.warn("Parser daemon is not running — restarting for next test");
-      restartDaemon();
-      return Collections.emptyList();
-    }
-
-    try {
-      // Send the test's time window to the daemon as "startMs endMs\n".
-      daemonIn.write(startTimeMillis + " " + endTimeMillis);
-      daemonIn.newLine();
-      daemonIn.flush();
-
-      // Poll for the daemon's response with a timeout so a hanging daemon does not freeze EvoMaster.
-      long deadline = System.currentTimeMillis() + 60_000;
-      while (!daemonOut.ready()) {
-        if (System.currentTimeMillis() > deadline) {
-          log.warn("Parser daemon timed out after 60 s — skipping this test");
-          return Collections.emptyList();
-        }
-        if (!daemonProcess.isAlive()) {
-          log.warn("Parser daemon exited unexpectedly — restarting for next test");
-          restartDaemon();
-          return Collections.emptyList();
-        }
-        try {
-          Thread.sleep(100);
-        } catch (InterruptedException ie) {
-          Thread.currentThread().interrupt();
-          return Collections.emptyList();
-        }
-      }
-
-      // The daemon responds with "OK" on success or "ERROR: <message>" on failure.
-      String response = daemonOut.readLine();
-      if (response == null || !response.equals("OK")) {
-        log.error("Parser daemon error: {}", response);
+    JsonNode templates;
+    if (lines.isEmpty()) {
+      templates = mapper.createArrayNode();
+    } else {
+      try {
+        templates = parse(lines);
+      } catch (IOException e) {
+        log.warn("Log parser request failed, no log targets for this test: {}", e.getMessage());
+        return Collections.emptyList();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
         return Collections.emptyList();
       }
-
-      Path resultPath = Paths.get(uniqueTemplatesFile);
-      if (!Files.exists(resultPath)) {
-        log.error("Result file not found: {}", uniqueTemplatesFile);
-        return Collections.emptyList();
-      }
-
-      // Each line is "{service}:{drain_id}\t{template_text}".
-      // Only the stable drain ID is used as descriptiveId; the template text is for debugging only.
-      for (String line : Files.readAllLines(resultPath, StandardCharsets.UTF_8)) {
-        if (line.trim().isEmpty()) continue;
-        String descriptiveId = "log:" + line.split("\t", 2)[0];
-        results.add(new TargetInfo(descriptiveId, 1.0, -1));
-      }
-
-    } catch (IOException e) {
-      throw new RuntimeException("Parser daemon communication failed", e);
     }
 
-    return results;
+    if (writer != null) {
+      writer.record(lines, templates);
+    }
+
+    List<TargetInfo> targets = new ArrayList<>(templates.size());
+    for (JsonNode t : templates) {
+      targets.add(new TargetInfo(targetId(t.path("source").asText(), t.path("id").asText()), 1.0, -1));
+    }
+    return targets;
+  }
+
+  /**
+   * Sends the lines to {@code POST /parse}.
+   *
+   * @return the {@code templates} array of the response
+   * @throws IOException if the request fails, the status is not 200, or the response has no {@code templates} array
+   */
+  private JsonNode parse(List<DockerLogFollower.Line> lines) throws IOException, InterruptedException {
+    ObjectNode body = mapper.createObjectNode();
+    ArrayNode lineArray = body.putArray("lines");
+    for (DockerLogFollower.Line line : lines) {
+      lineArray.addObject()
+          .put("source", line.source())
+          .put("text", line.text());
+    }
+
+    HttpRequest request = HttpRequest.newBuilder(parseUri)
+        .timeout(PARSE_TIMEOUT)
+        .header("Content-Type", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
+        .build();
+
+    HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+    if (response.statusCode() != 200) {
+      throw new IOException("HTTP " + response.statusCode() + ": " + response.body());
+    }
+
+    JsonNode templates = mapper.readTree(response.body()).path("templates");
+    if (!templates.isArray()) {
+      throw new IOException("response has no 'templates' array");
+    }
+    return templates;
   }
 }

@@ -69,7 +69,12 @@ abstract class EnterpriseFitness<T> : FitnessFunction<T>() where T : Individual 
     private fun initialize(){
         //TODO populate additionalTargetCollectors based on config
         if (config.enableLogCollector) {
-            additionalTargetCollectors.add(LogCollector())
+            additionalTargetCollectors.add(LogCollector(
+                config.logCollectorComposeProject,
+                config.logCollectorParserImage,
+                if (config.logCollectorWriteTemplates) config.logCollectorTemplatesFile else null,
+                if (config.logCollectorWriteTrace) config.logCollectorTraceFile else null
+            ))
         }
     }
 
